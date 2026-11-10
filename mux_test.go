@@ -394,12 +394,16 @@ func TestMuxNestedNotFound(t *testing.T) {
 func TestMethodNotAllowed(t *testing.T) {
 	r := NewRouter()
 
-	r.Get("/hi", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/hi", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("hi, get"))
 	})
 
-	r.Head("/hi", func(w http.ResponseWriter, r *http.Request) {
+	r.Head("/hi", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("hi, head"))
+	})
+
+	r.Get("/*", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("catch-all"))
 	})
 
 	ts := httptest.NewServer(r)
@@ -1509,6 +1513,43 @@ func TestMountingSimilarPattern(t *testing.T) {
 	}
 }
 
+// TestMountingSelf ensures Mount() panics instead of wiring a router (or an
+// inline mux derived from it via With()/Group(), which shares the same
+// underlying tree) back onto itself. Without this guard, any request that
+// doesn't match a defined route recurses through the same mount forever,
+// spinning a goroutine at 100% CPU instead of falling through to a 404.
+// See https://github.com/go-chi/chi/issues/843.
+func TestMountingSelf(t *testing.T) {
+	t.Run("direct self-mount", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("expected panic()")
+			}
+		}()
+
+		r := NewRouter()
+		r.Get("/ping", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("pong"))
+		})
+		r.Mount("/", r)
+	})
+
+	t.Run("mount of inline mux sharing the same tree", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("expected panic()")
+			}
+		}()
+
+		r := NewRouter().With(func(next http.Handler) http.Handler { return next })
+		r.Mount("/", r.Group(func(r Router) {
+			r.Get("/ping", func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("pong"))
+			})
+		}))
+	})
+}
+
 func TestMuxEmptyParams(t *testing.T) {
 	r := NewRouter()
 	r.Get(`/users/{x}/{y}/{z}`, func(w http.ResponseWriter, r *http.Request) {
@@ -1804,6 +1845,57 @@ func TestCustomHTTPMethod(t *testing.T) {
 	}
 }
 
+func TestQueryHTTPMethod(t *testing.T) {
+	r := NewRouter()
+
+	r.Get("/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("get"))
+	})
+
+	// QUERY is a safe, idempotent http method that conveys a request body,
+	// see RFC 10008.
+	r.Query("/search", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Write([]byte(fmt.Sprintf("query: %s", body)))
+	})
+
+	r.MethodFunc("QUERY", "/reports", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("reports"))
+	})
+
+	r.HandleFunc("/any", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("any"))
+	})
+
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	if _, body := testRequest(t, ts, "QUERY", "/search", bytes.NewReader([]byte("select 1"))); body != "query: select 1" {
+		t.Fatal(body)
+	}
+	if _, body := testRequest(t, ts, "GET", "/search", nil); body != "get" {
+		t.Fatal(body)
+	}
+	if _, body := testRequest(t, ts, "QUERY", "/reports", nil); body != "reports" {
+		t.Fatal(body)
+	}
+	if _, body := testRequest(t, ts, "QUERY", "/any", nil); body != "any" {
+		t.Fatal(body)
+	}
+
+	// An unregistered method on the same route responds 405 with QUERY
+	// listed in the Allow header.
+	resp, _ := testRequest(t, ts, "POST", "/search", nil)
+	if resp.StatusCode != 405 {
+		t.Fatal(resp.Status)
+	}
+	allowedMethods := resp.Header.Values("Allow")
+	if len(allowedMethods) != 2 || ((allowedMethods[0] != "GET" || allowedMethods[1] != "QUERY") &&
+		(allowedMethods[1] != "GET" || allowedMethods[0] != "QUERY")) {
+		t.Fatal("Allow header should contain 2 headers: GET, QUERY. Received: ", allowedMethods)
+	}
+}
+
 func TestMuxMatch(t *testing.T) {
 	r := NewRouter()
 	r.Get("/hi", func(w http.ResponseWriter, r *http.Request) {
@@ -2061,9 +2153,7 @@ func BenchmarkMux(b *testing.B) {
 			r, _ := http.NewRequest("GET", path, nil)
 
 			b.ReportAllocs()
-			b.ResetTimer()
-
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				mx.ServeHTTP(w, r)
 			}
 		})
