@@ -9,10 +9,7 @@ import (
 
 // URLParam returns the url parameter from a http.Request object.
 func URLParam(r *http.Request, key string) string {
-	if rctx := RouteContext(r.Context()); rctx != nil {
-		return rctx.URLParam(key)
-	}
-	return ""
+	return URLParamFromCtx(r.Context(), key)
 }
 
 // URLParamFromCtx returns the url parameter from a http.Request Context.
